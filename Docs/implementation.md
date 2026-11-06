@@ -277,6 +277,18 @@ Three fixes, in order of payoff:
 
 `L = 210 um` with `n_g ~ 3.6` gives `tau_max = 5.0 ps`. At 50 Gb/s the symbol period is 20 ps, so `T` is four times the delay spread and `eta` will come out near zero. **The current device geometry sits in the regime where the challenge bits are inert.** This is expected and is not a bug in the code; it is the finding the simulator exists to quantify. Run the `eta` sweep of Section 8.1 on this geometry first to establish the baseline, then use it to justify the longer device that the entropy accounting in Section 8.3 independently calls for.
 
+### 4.8 Multimode extension (opt-in)
+
+Single-mode (one guided mode per waveguide, 4x4 CMT) remains the **default**. Multimode is selected explicitly:
+
+| `mode_model` | Behavior |
+|---|---|
+| `"single"` (default) | Force M1=M2=1, legacy 4x4 fast path |
+| `"auto"` | Mode count from waveguide widths `w1`, `w2` via `puf/modes.py` (EIM slab) |
+| `"fixed"` | Cap at `n_modes_max` (widths preferred; else synthetic n_eff ladder) |
+
+Physics: state dimension `d = 2*(M1+M2)`, coupling becomes matrices `K11,K12,K22` from lateral sidewall overlaps (anchored so `K12[0,0] = kappa12`). Each mode pair phase-matches at `λ_ij = Λ·(n1_i + n2_j)`, so one grating produces multiple stopbands. The receiver sums mode powers on one PD per wavelength (`reflection_power_spectrum`); key shape is unchanged. Toggle in `modulator/send_to_puf.py` via `_MODE_MODEL`, `_W1`, `_W2`, `_N_MODES_MAX`.
+
 ---
 
 ## 5. Class 2: `WDMGrid` and Class 3: `Modulator`

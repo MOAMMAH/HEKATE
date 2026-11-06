@@ -38,6 +38,13 @@ from puf.puf_model import ContraDCPUF, SimGrid
 # fails the 10%-of-peak stopband check.
 _LAMBDA0_EDGE = 312.5e-9
 
+# Mode selection: "single" (default, legacy 4x4) or "auto"/"fixed" multimode.
+_MODE_MODEL = "single"
+_W1 = 1.2e-6  # used when mode_model is auto/fixed
+_W2 = 1.0e-6
+_N_MODES_MAX = 3
+_GAP = 200e-9
+
 # Front-loaded sample offsets (fraction of symbol period) — catch grating ring-down.
 _SAMPLE_OFFSETS = (0.1, 0.25, 0.45, 0.75)
 # Late in the symbol, after the grating has settled as far as it is going to.
@@ -53,11 +60,26 @@ def reflect_field(
     puf: ContraDCPUF,
     H: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Apply the PUF drop-port transfer function to a baseband field."""
+    """Apply the PUF drop-port transfer; modes summed in power at the PD.
+
+    Returns a single complex field whose |·|^2 equals Σ_j |r_j * X|^2
+    (phase of the fundamental component, for demux continuity).
+    """
     X = np.fft.fft(field)
-    if H is None:
-        H = puf.reflection_spectrum(f0 + simgrid.f)
-    return np.fft.ifft(X * H)
+    if H is not None:
+        return np.fft.ifft(X * H)
+
+    if getattr(puf, "M2", 1) <= 1:
+        H0 = puf.reflection_spectrum(f0 + simgrid.f)
+        return np.fft.ifft(X * H0)
+
+    # Multimode: filter each drop mode, sum powers, keep fund. phase.
+    rm = puf.drop_amplitudes(f0 + simgrid.f)  # (n, M2)
+    y_modes = np.fft.ifft(X[:, None] * rm, axis=0)
+    power = np.sum(np.abs(y_modes) ** 2, axis=1)
+    y0 = y_modes[:, 0]
+    phase = np.exp(1j * np.angle(y0 + 0.0))
+    return np.sqrt(np.clip(power, 0.0, None)) * phase
 
 
 def send_challenge(
@@ -121,7 +143,11 @@ def cw_reference(
     # Average the middle half: the FFT wrap disturbs both ends of the window.
     lo, hi = simgrid.n // 4, 3 * simgrid.n // 4
     measured = np.mean(np.abs(ch[:, lo:hi]) ** 2, axis=1)
-    theory = (mod.p_launch / n_ch) * np.abs(puf.reflection_spectrum(carriers)) ** 2
+    if hasattr(puf, "reflection_power_spectrum"):
+        r2 = puf.reflection_power_spectrum(carriers)
+    else:
+        r2 = np.abs(puf.reflection_spectrum(carriers)) ** 2
+    theory = (mod.p_launch / n_ch) * r2
     return measured, theory
 
 
@@ -252,8 +278,14 @@ def key_difference_plot(
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
-    # Separate bit-flip figure kept on the same path's sibling for clarity.
-    out_bits = out_path.with_name(out_path.stem + "_bits.png")
+    # Separate bit-flip figure: key_difference_<tag>.png -> key_difference_bits_<tag>.png
+    stem = out_path.stem
+    if stem.startswith("key_difference_"):
+        out_bits = out_path.with_name(
+            "key_difference_bits_" + stem[len("key_difference_") :] + ".png"
+        )
+    else:
+        out_bits = out_path.with_name(stem + "_bits.png")
     fig2, ax2 = plt.subplots(figsize=(7, 3.6), constrained_layout=True)
     im1 = ax2.imshow(
         bit_flips,
@@ -352,15 +384,23 @@ def summary_figure(
 
     # --- Row 0: PUF drop-port response and the steady-state control ---------
     bragg_nm = puf.Lambda0 * (puf.n1_0 + puf.n2_0) * 1e9
+    bragg_all = puf.bragg_wavelengths() * 1e9
     wl_wide, hd_db = puf.drop_port_response(
-        np.linspace(min(1480.0, carriers_nm.min() - 40.0), bragg_nm + 60.0, 801)
+        np.linspace(min(1480.0, carriers_nm.min() - 40.0), bragg_all.max() + 60.0, 801)
     )
     ax = axes[0, 0]
     ax.plot(wl_wide, hd_db, lw=1.0)
     for wl in carriers_nm:
         ax.axvline(wl, color="crimson", ls="--", lw=0.8)
-    ax.axvline(bragg_nm, color="seagreen", ls="-", lw=1.0, label="Bragg peak")
-    ax.set_title("PUF drop port $|r|^2$ (dB), carriers dashed", fontsize=9)
+    ax.axvline(bragg_nm, color="seagreen", ls="-", lw=1.0, label="Bragg (fund.)")
+    if puf.M2 > 1:
+        for bij in np.unique(bragg_all.ravel()):
+            ax.axvline(bij, color="seagreen", ls=":", lw=0.6, alpha=0.7)
+    mode_tag = f"M1={puf.M1}, M2={puf.M2}"
+    ax.set_title(
+        f"PUF drop $|r|^2$ (dB), power-summed — {mode_tag}",
+        fontsize=9,
+    )
     ax.set_xlabel("wavelength (nm)", fontsize=8)
     ax.set_ylabel("$|r|^2$ (dB)", fontsize=8)
     ax.tick_params(labelsize=7)
@@ -372,17 +412,31 @@ def summary_figure(
     ax = axes[0, 1]
     lo = min(carriers_nm.min() - 12.0, bragg_nm - 45.0)
     wl_zoom = np.linspace(lo, carriers_nm.max() + 16.0, 700)
-    r_zoom = np.abs(puf.reflection_spectrum(C_LIGHT / (wl_zoom * 1e-9))) ** 2
+    r_zoom = puf.reflection_power_spectrum(C_LIGHT / (wl_zoom * 1e-9))
     ax.plot(wl_zoom, r_zoom, lw=1.0)
-    r_ch = np.abs(puf.reflection_spectrum(mod.grid.frequencies())) ** 2
+    r_ch = puf.reflection_power_spectrum(mod.grid.frequencies())
     ax.plot(carriers_nm, r_ch, "o", color="crimson", ms=6, zorder=3, label="carriers")
     ax.axhline(0.5 * r_zoom.max(), color="0.5", ls=":", lw=0.9, label="3 dB")
+    # Per-mode power fractions at the WDM band center (multimode only).
+    if puf.M2 > 1:
+        rm = puf.drop_amplitudes(mod.grid.frequencies())
+        frac = np.mean(np.abs(rm) ** 2, axis=0)
+        frac = frac / max(float(frac.sum()), 1e-30)
+        ax.text(
+            0.02,
+            0.98,
+            "mode power frac:\n" + ", ".join(f"{f:.2f}" for f in frac),
+            transform=ax.transAxes,
+            va="top",
+            fontsize=7,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7),
+        )
     ax.set_title(
         f"Band edge at the WDM grid — $|r|^2$ = {r_ch.min():.2f}..{r_ch.max():.2f}",
         fontsize=9,
     )
     ax.set_xlabel("wavelength (nm)", fontsize=8)
-    ax.set_ylabel("$|r|^2$", fontsize=8)
+    ax.set_ylabel("$|r|^2$ (mode-summed)", fontsize=8)
     ax.tick_params(labelsize=7)
     ax.legend(fontsize=7)
     ax.grid(alpha=0.3)
@@ -493,14 +547,49 @@ def summary_figure(
     plt.close(fig)
 
 
+def _build_puf() -> ContraDCPUF:
+    """Construct the readout device from the mode-model knobs above."""
+    kwargs = dict(device_id=0, L=2.0e-3, n_sect=200, Lambda0=_LAMBDA0_EDGE)
+    if _MODE_MODEL == "single":
+        return ContraDCPUF(mode_model="single", **kwargs)
+
+    # Retune Λ so the fundamental Bragg sits near 1550 nm, then apply the
+    # same relative edge offset used in the single-mode (_LAMBDA0_EDGE) case.
+    from puf.modes import slab_modes
+
+    m1 = slab_modes(_W1, 1550e-9, _N_MODES_MAX)
+    m2 = slab_modes(_W2, 1550e-9, _N_MODES_MAX)
+    lam_center = 1550e-9 / (float(m1.n_eff[0]) + float(m2.n_eff[0]))
+    lam_edge = lam_center * (_LAMBDA0_EDGE / 305.72e-9)
+    kwargs["Lambda0"] = lam_edge
+    # Multimode TMM is heavier; fewer sections keep the run tractable.
+    kwargs["n_sect"] = 80
+    return ContraDCPUF(
+        mode_model=_MODE_MODEL,
+        w1=_W1,
+        w2=_W2,
+        gap=_GAP,
+        n_modes_max=_N_MODES_MAX,
+        **kwargs,
+    )
+
+
 if __name__ == "__main__":
     # Same everything; only the bit sequence changes between A and B.
     grid = WDMGrid()
-    sim = SimGrid(fs=4e12, n=16384)
+    # Multimode TMM is ~d^3 heavier; use a shorter grid so a 3-mode run finishes.
+    sim_n = 8192 if _MODE_MODEL != "single" else 16384
+    sim = SimGrid(fs=4e12, n=sim_n)
     f0 = C_LIGHT / 1550e-9
     # Longer device so symbol period is not ≫ τ_max (otherwise Δkey ≈ 0).
     # Period retuned so the carriers land on the band edge, not the flat top.
-    puf = ContraDCPUF(device_id=0, L=2.0e-3, n_sect=200, Lambda0=_LAMBDA0_EDGE)
+    puf = _build_puf()
+    print(
+        f"mode_model={puf.mode_model}, M1={puf.M1}, M2={puf.M2}, "
+        f"legacy_4x4={puf.use_legacy_4x4}, sim.n={sim.n}, n_sect={puf.n_sect}"
+    )
+    if puf.M2 > 1:
+        print(f"Bragg λ_ij / nm =\n{puf.bragg_wavelengths()*1e9}")
     p_per_ch = 10e-3  # 10 mW per WDM channel
     mod = Modulator(
         grid=grid,
@@ -517,7 +606,11 @@ if __name__ == "__main__":
     assert not np.array_equal(challenge_a, challenge_b)
 
     # Same H(f) for both challenges — device/grid unchanged.
-    H = puf.reflection_spectrum(f0 + sim.f)
+    # Single-mode: pass precomputed H for speed. Multimode: reflect_field
+    # recomputes mode amplitudes (power-summed at the PD).
+    H = None
+    if puf.M2 <= 1:
+        H = puf.reflection_spectrum(f0 + sim.f)
     tx_a, rx_a = send_challenge(puf, mod, challenge_a, sim, f0, H=H)
     tx_b, rx_b = send_challenge(puf, mod, challenge_b, sim, f0, H=H)
 
@@ -539,9 +632,15 @@ if __name__ == "__main__":
     # full_scale in quantize_gray is on (power / p_launch_ref); convert back to watts.
     full_scale_power = fs_a * tx_a.p_launch_ref
 
+    # Unique suffix so single-mode / multimode runs do not overwrite each other.
+    if puf.mode_model == "single" or puf.M2 <= 1:
+        out_tag = "single"
+    else:
+        out_tag = f"{puf.mode_model}_m{puf.M2}"
+
     out_dir = Path(__file__).resolve().parent / "out"
     out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / "key_difference.png"
+    out_path = out_dir / f"key_difference_{out_tag}.png"
     stats = key_difference_plot(
         key_a, key_b, raw_a, raw_b, out_path, full_scale_power=full_scale_power
     )
@@ -549,7 +648,7 @@ if __name__ == "__main__":
     carriers = mod.grid.frequencies()
     pow_a = np.abs(demux_channels(rx_a, sim, f0, carriers)) ** 2
     pow_b = np.abs(demux_channels(rx_b, sim, f0, carriers)) ** 2
-    summary_path = out_dir / "puf_readout_summary.png"
+    summary_path = out_dir / f"puf_readout_summary_{out_tag}.png"
     summary_figure(
         puf,
         mod,
@@ -578,7 +677,7 @@ if __name__ == "__main__":
         float(np.mean(np.abs(tx_a.channel_fields[i, :burst]) ** 2))
         for i in range(grid.n_channels)
     ]
-    print(f"WDM λ/nm = {grid.wavelengths()*1e9}")
+    print(f"WDM lambda/nm = {grid.wavelengths()*1e9}")
     print(f"p_launch total = {mod.p_launch*1e3:.1f} mW  ({p_per_ch*1e3:.1f} mW/ch target)")
     print(f"p_launch measured /ch (burst) = {[f'{p*1e3:.2f} mW' for p in p_ch]}")
     print(f"PUF L={puf.L*1e3:.2f} mm, tau_max={puf.tau_max*1e12:.1f} ps")

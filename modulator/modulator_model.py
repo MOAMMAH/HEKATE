@@ -229,13 +229,18 @@ class Modulator:
             return ["PUF |r| peak is ~0; cannot place carriers"]
 
         f_ch = self.grid.frequencies()
-        r_ch = puf.reflection_spectrum(f_ch)
+        # Mode-summed power (single-PD); falls back to |r0|^2 when M=1.
+        if hasattr(puf, "reflection_power_spectrum"):
+            p_ch = puf.reflection_power_spectrum(f_ch)
+            amp_ch = np.sqrt(np.clip(p_ch, 0.0, None))
+        else:
+            amp_ch = np.abs(puf.reflection_spectrum(f_ch))
         warnings_out = []
-        for i, (fi, ri) in enumerate(zip(f_ch, r_ch)):
-            if abs(ri) < threshold * peak:
+        for i, (fi, ai) in enumerate(zip(f_ch, amp_ch)):
+            if ai < threshold * peak:
                 wl_nm = C_LIGHT / fi * 1e9
                 warnings_out.append(
-                    f"channel {i} @ {wl_nm:.2f} nm: |r|/|r|_peak = {abs(ri)/peak:.3f} < {threshold}"
+                    f"channel {i} @ {wl_nm:.2f} nm: |r|/|r|_peak = {ai/peak:.3f} < {threshold}"
                 )
         return warnings_out
 

@@ -481,3 +481,92 @@ def test_uniform_grating_is_independent_of_section_count():
         rtol=1e-10,
         atol=1e-13,
     )
+
+
+# ===========================================================================
+# Multimode: mode solver + CMT generalization
+# ===========================================================================
+
+
+class TestMultimode:
+    def test_default_is_single_mode_legacy(self):
+        puf = ContraDCPUF(device_id=0)
+        assert puf.mode_model == "single"
+        assert puf.M1 == 1 and puf.M2 == 1
+        assert puf.use_legacy_4x4
+
+    def test_legacy_matches_general_cmt_m1(self):
+        """force_general_cmt with M=1 must match the 4x4 fast path."""
+        kwargs = dict(
+            device_id=5,
+            L=210e-6,
+            n_sect=20,
+            sigma_dn=0.0,
+            sigma_kappa_rel=0.0,
+            sigma_dLambda=0.0,
+        )
+        legacy = ContraDCPUF(mode_model="single", **kwargs)
+        general = ContraDCPUF(
+            mode_model="single", force_general_cmt=True, **kwargs
+        )
+        assert legacy.use_legacy_4x4
+        assert not general.use_legacy_4x4
+        r0 = legacy.reflection_spectrum(F_BAND)
+        r1 = general.reflection_spectrum(F_BAND)
+        np.testing.assert_allclose(r1, r0, rtol=1e-9, atol=1e-12)
+
+    def test_mode_count_increases_with_width(self):
+        from puf.modes import n_modes_supported
+
+        widths = np.array([0.5e-6, 0.9e-6, 1.4e-6, 2.0e-6])
+        counts = [n_modes_supported(w, 1.55e-6) for w in widths]
+        assert all(counts[i] <= counts[i + 1] for i in range(len(counts) - 1))
+        assert counts[0] >= 1
+        assert counts[-1] >= counts[0] + 1
+
+    def test_auto_multimode_drop_shape_and_passivity(self):
+        puf = ContraDCPUF(
+            device_id=1,
+            mode_model="auto",
+            w1=1.2e-6,
+            w2=1.0e-6,
+            n_modes_max=3,
+            n_sect=16,
+            L=210e-6,
+            sigma_dn=0.0,
+            sigma_kappa_rel=0.0,
+            sigma_dLambda=0.0,
+        )
+        assert puf.M1 >= 2 and puf.M2 >= 2
+        assert not puf.use_legacy_4x4
+        rm = puf.drop_amplitudes(F_BAND)
+        assert rm.shape == (F_BAND.size, puf.M2)
+        ports = puf.port_amplitudes(F_BAND)
+        assert float(np.max(ports["total_power"])) <= 1.0 + 1e-8
+        # Power-summed spectrum equals Σ|r_j|²
+        p_sum = puf.reflection_power_spectrum(F_BAND)
+        np.testing.assert_allclose(p_sum, np.sum(np.abs(rm) ** 2, axis=1), rtol=1e-12)
+
+    def test_bragg_wavelengths_match_phase_match(self):
+        puf = ContraDCPUF(
+            device_id=0,
+            mode_model="fixed",
+            n_modes_max=2,
+            n_sect=12,
+            L=210e-6,
+            sigma_dn=0.0,
+            sigma_kappa_rel=0.0,
+            sigma_dLambda=0.0,
+        )
+        expected = puf.Lambda0 * (
+            puf.n_eff1[:, None] + puf.n_eff2[None, :]
+        )
+        np.testing.assert_allclose(puf.bragg_wavelengths(), expected)
+
+    def test_k12_00_anchored(self):
+        from puf.modes import coupling_matrices, slab_modes
+
+        m1 = slab_modes(1.2e-6, 1.55e-6, n_modes_max=2)
+        m2 = slab_modes(1.0e-6, 1.55e-6, n_modes_max=2)
+        _, k12, _ = coupling_matrices(m1, m2, 5000.0, 16300.0, 6200.0)
+        np.testing.assert_allclose(k12[0, 0], 16300.0)
